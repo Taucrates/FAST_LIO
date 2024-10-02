@@ -1,0 +1,29 @@
+<launch>
+<!-- Launch file for debugging Livox MID360 LiDAR -->
+ 	<node pkg="tf" type="static_transform_publisher" name="map_to_camera_init" args="0 0 0.26 0 0.261799 0 /map /camera_init 40" /> <!--Original-->
+  <node pkg="tf" type="static_transform_publisher" name="base_to_lidar" args="0 0 0.05 0 0.261799 0 /bat /livox 40" /> 
+  <!-- <node pkg="tf" type="static_transform_publisher" name="body_to_lidar" args="0 0 0.0 0 0 0 /body /livox 40" />  -->
+
+  <!-- FASTLIO -->
+  <!-- Driver -->
+  <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch">
+    <arg name="xfer_format" value="2"/> <!--0: Livox PointCloud2, 1: Livox Custom PC, (2): ROS PointCloud2 -->
+    <arg name="publish_freq" value="10.0"/>
+    <arg name="msg_frame_id" value="livox"/>
+    <arg name="node_output" value="log"/>
+  </include>
+
+  <!-- Lidar odometry -->
+  <include file="$(find fast_lio)/launch/mapping_mid360.launch">
+    <arg name="rviz" value="false" />
+    <arg name="node_output" value="log" />
+    <arg name="config_file" value="mid360_ardupilot" /> <!-- mid360_ardupilot to use the ardupilot IMU-->
+
+  </include>
+
+  <!-- OPTITRACK -->
+  <include file="$(find srv_odom_utils)/launch/optitrack_explorer.launch">
+    <!-- <arg name="cmd_vel_topic" value="/safety_manager/twist_out"/> -->
+  </include>
+
+</launch>

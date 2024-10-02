@@ -56,7 +56,7 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
-#include <livox_ros_driver/CustomMsg.h>
+#include <livox_ros_driver2/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -94,7 +94,11 @@ int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudVal
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
-int lidar_type;
+
+
+// Variables to calculate Twist
+double last_time = 0.0;
+geometry_msgs::PoseWithCovariance last_pose;
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -299,7 +303,7 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
-void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg) 
+void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg) 
 {
     mtx_buffer.lock();
     double preprocess_start_time = omp_get_wtime();
@@ -376,8 +380,6 @@ bool sync_packages(MeasureGroup &meas)
     {
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
-
-
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
@@ -393,8 +395,6 @@ bool sync_packages(MeasureGroup &meas)
             lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
             lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
         }
-        if(lidar_type == MARSIM)
-            lidar_end_time = meas.lidar_beg_time;
 
         meas.lidar_end_time = lidar_end_time;
 
@@ -586,13 +586,59 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const ros::Publisher & pubOdomAftMapped)
+
+void publish_odometry(const ros::Publisher & pubOdomAftMapped, const ros::Publisher & pubTwist)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
+    // pubOdomAftMapped.publish(odomAftMapped);
+
+    // // New FILLING TWIST
+    // Time between estimations
+    double d_time = lidar_end_time - last_time;
+
+    // Computing Twist
+    tf::Vector3 delta_world;
+
+    delta_world.setX((state_point.pos(0) - last_pose.pose.position.x) / d_time); 
+    delta_world.setY((state_point.pos(1) - last_pose.pose.position.y) / d_time); 
+    delta_world.setZ((state_point.pos(2) - last_pose.pose.position.z) / d_time); 
+
+    tf::Quaternion curr_q, last_q;
+
+    tf::quaternionMsgToTF(odomAftMapped.pose.pose.orientation, curr_q);
+    tf::Matrix3x3 curr_m(curr_q);
+    double curr_roll, curr_pitch, curr_yaw;
+    curr_m.getRPY(curr_roll, curr_pitch, curr_yaw);
+    // printf("\n\n Roll: %2.3lf, Pitch: %2.3lf, Yaw: %2.3lf \n\n", curr_roll, curr_pitch, curr_yaw);
+
+    tf::quaternionMsgToTF(last_pose.pose.orientation, last_q);
+    tf::Matrix3x3 last_m(last_q);
+    double last_roll, last_pitch, last_yaw;
+    last_m.getRPY(last_roll, last_pitch, last_yaw);
+
+    tf::Vector3 delta_robot = curr_m.inverse() * delta_world;
+    odomAftMapped.twist.twist.linear.x = delta_robot.x();
+    odomAftMapped.twist.twist.linear.y = delta_robot.y();
+    odomAftMapped.twist.twist.linear.z = delta_robot.z();
+
+    odomAftMapped.twist.twist.angular.x = (curr_roll - last_roll) / d_time; 
+    odomAftMapped.twist.twist.angular.y = (curr_pitch - last_pitch) / d_time; 
+    odomAftMapped.twist.twist.angular.z = (curr_yaw - last_yaw) / d_time; 
+
+    set_posestamp(last_pose); // Saving last pose
+    last_time = lidar_end_time; 
+
+    geometry_msgs::TwistStamped current_twist;
+    current_twist.header = odomAftMapped.header;
+    current_twist.twist = odomAftMapped.twist.twist; 
+
+    pubTwist.publish(current_twist);
+
+    // // End New
+
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -604,6 +650,9 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+
+    // Antoni Tauler: Is publishing the covariance?
+    pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
@@ -779,7 +828,7 @@ int main(int argc, char** argv)
     nh.param<double>("mapping/b_gyr_cov",b_gyr_cov,0.0001);
     nh.param<double>("mapping/b_acc_cov",b_acc_cov,0.0001);
     nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
-    nh.param<int>("preprocess/lidar_type", lidar_type, AVIA);
+    nh.param<int>("preprocess/lidar_type", p_pre->lidar_type, AVIA);
     nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 16);
     nh.param<int>("preprocess/timestamp_unit", p_pre->time_unit, US);
     nh.param<int>("preprocess/scan_rate", p_pre->SCAN_RATE, 10);
@@ -791,8 +840,6 @@ int main(int argc, char** argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
-
-    p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
     
     path.header.stamp    = ros::Time::now();
@@ -822,7 +869,7 @@ int main(int argc, char** argv)
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
-    p_imu->lidar_type = lidar_type;
+
     double epsi[23] = {0.001};
     fill(epsi, epsi+23, 0.001);
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
@@ -856,6 +903,8 @@ int main(int argc, char** argv)
             ("/Laser_map", 100000);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
             ("/Odometry", 100000);
+    ros::Publisher pubTwist = nh.advertise<geometry_msgs::TwistStamped> 
+            ("/fastLIO/twist", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
 //------------------------------------------------------------------------------------------------------
@@ -969,7 +1018,7 @@ int main(int argc, char** argv)
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped);
+            publish_odometry(pubOdomAftMapped, pubTwist);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
